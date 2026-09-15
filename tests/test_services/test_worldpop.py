@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 import rasterio
 from rasterio.transform import from_origin
+from shapely.geometry import box
 
 import app.services.worldpop as worldpop
 from app.routers import auth
@@ -115,15 +116,33 @@ async def test_pop_queries_with_local_raster(
     assert await service.get_pop_radius("nzl", 7.5, 2.5, 2_000_000) == 5050
     with pytest.raises(
         CoordinatesOutsideCountryError,
-        match="coordinates supplied are outside of the country specified",
+        match=(
+            "the submitted point is not within the bounds of the WorldPop tile "
+            "for country code NZL"
+        ),
     ):
         await service.get_pop_radius("nzl", -80.0, 170.0, 10_000)
+
+    with pytest.raises(
+        CoordinatesOutsideCountryError,
+        match=(
+            "the submitted point is not within the bounds of the WorldPop tile "
+            "for country code NZL"
+        ),
+    ):
+        await service.get_pop("nzl", -80.0, 170.0)
 
     geojson = {
         "type": "Polygon",
         "coordinates": [[[0, 10], [2, 10], [2, 8], [0, 8], [0, 10]]],
     }
     assert await service.get_pop_shape("nzl", geojson) == 26
+
+    partial_geojson = {
+        "type": "Polygon",
+        "coordinates": [[[9, 0], [9.5, 0], [9.5, 0.5], [9, 0.5], [9, 0]]],
+    }
+    assert await service.get_pop_shape("nzl", partial_geojson) == 25
 
     outside_geojson = {
         "type": "Polygon",
@@ -135,7 +154,25 @@ async def test_pop_queries_with_local_raster(
     ):
         await service.get_pop_shape("nzl", outside_geojson)
 
-    assert tile_requests == ["NZL", "NZL", "NZL", "NZL", "NZL"]
+    assert tile_requests == ["NZL", "NZL", "NZL", "NZL", "NZL", "NZL", "NZL"]
+
+
+def test_population_sum_weights_partially_covered_cells(
+    tmp_path, suppress_rasterio_affine_warning
+):
+    raster_path = tmp_path / "NZL_pop.tif"
+    _write_test_raster(raster_path)
+
+    population = worldpop._sum_raster_population_with_cell_coverage(
+        str(raster_path),
+        [box(9, 0, 9.5, 0.5)],
+    )
+
+    assert population == 25
+    assert worldpop._sum_raster_population_with_cell_coverage(
+        str(raster_path),
+        [box(9, 0, 9.75, 1), box(9.25, 0, 10, 1)],
+    ) == 100
 
 
 @pytest.fixture

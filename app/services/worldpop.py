@@ -16,14 +16,18 @@ from app.repositories.tiles import TileRepository
 from app.services.exceptions import InvalidPopulationInputError
 from rasterio.features import geometry_mask
 from rasterio.windows import from_bounds
-from shapely.geometry import GeometryCollection, Point, mapping, shape
+from shapely.geometry import GeometryCollection, Point, Polygon, mapping, shape
 from shapely.geometry import box
-from shapely.ops import transform
+from shapely.ops import transform, unary_union
 from sqlalchemy.ext.asyncio import AsyncSession
 
 
 class CoordinatesOutsideCountryError(ValueError):
-    pass
+    def __init__(self, iso3: str):
+        super().__init__(
+            "the submitted point is not within the bounds of the WorldPop tile "
+            f"for country code {iso3}"
+        )
 
 
 class GeoJSONOutsideCountryError(ValueError):
@@ -208,6 +212,11 @@ class WorldPopService:
         iso3 = self._normalize_iso3(iso3)
         logging.info("get_pop: iso3=%s lat=%s lon=%s", iso3, lat, lon)
         file_path = await self.get_tile_path(iso3)
+        within_bounds = await asyncio.to_thread(
+            _coordinates_within_raster, file_path, lat, lon
+        )
+        if not within_bounds:
+            raise CoordinatesOutsideCountryError(iso3)
         return await asyncio.to_thread(_sample_population, file_path, lat, lon)
 
     async def get_pop_radius(
@@ -227,9 +236,7 @@ class WorldPopService:
             _coordinates_within_raster, file_path, lat, lon
         )
         if not within_bounds:
-            raise CoordinatesOutsideCountryError(
-                "coordinates supplied are outside of the country specified"
-            )
+            raise CoordinatesOutsideCountryError(iso3)
 
         aeqd_proj = pyproj.Proj(
             proj="aeqd", ellps="WGS84", datum="WGS84", lat_0=lat, lon_0=lon
@@ -239,7 +246,9 @@ class WorldPopService:
             aeqd_proj, wgs84_proj, always_xy=True
         ).transform
         buffer_wgs84 = transform(project_to_wgs84, Point(0, 0).buffer(radius_meters))
-        return await self._sum_population_within_geometry(file_path, [buffer_wgs84])
+        return await asyncio.to_thread(
+            _sum_raster_population_with_cell_coverage, file_path, [buffer_wgs84]
+        )
 
     async def get_pop_shape(self, iso3: str, geojson: dict) -> int:
         iso3 = self._normalize_iso3(iso3)
@@ -254,7 +263,9 @@ class WorldPopService:
         )
         if not intersects:
             raise GeoJSONOutsideCountryError(normalize_iso3(iso3))
-        return await self._sum_population_within_geometry(file_path, geometries)
+        return await asyncio.to_thread(
+            _sum_raster_population_with_cell_coverage, file_path, geometries
+        )
 
     @staticmethod
     def validate_radius(radius_meters: float) -> None:
@@ -349,3 +360,39 @@ def _sum_raster_population(file_path: str, geometries: list[Any]) -> int:
         if not valid_mask.any():
             return 0
         return int(round(float(window_data.data[valid_mask].sum())))
+
+
+def _sum_raster_population_with_cell_coverage(
+    file_path: str, geometries: list[Any]
+) -> int:
+    with rasterio.open(file_path) as src:
+        geometry = unary_union(geometries)
+        minx, miny, maxx, maxy = geometry.bounds
+        window = from_bounds(minx, miny, maxx, maxy, src.transform)
+        try:
+            window = window.intersection(
+                rasterio.windows.Window(0, 0, src.width, src.height)
+            )
+        except WindowError:
+            return 0
+        if window.width <= 0 or window.height <= 0:
+            return 0
+        window_data = src.read(1, window=window, masked=True)
+        if window_data.size == 0:
+            return 0
+
+        window_transform = src.window_transform(window)
+        total = 0.0
+        for row, column in zip(*np.nonzero(~np.ma.getmaskarray(window_data))):
+            cell = Polygon(
+                [
+                    window_transform * (column, row),
+                    window_transform * (column + 1, row),
+                    window_transform * (column + 1, row + 1),
+                    window_transform * (column, row + 1),
+                ]
+            )
+            covered_fraction = geometry.intersection(cell).area / cell.area
+            total += float(window_data.data[row, column]) * covered_fraction
+
+        return int(round(total))

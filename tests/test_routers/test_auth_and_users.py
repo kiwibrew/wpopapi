@@ -12,6 +12,7 @@ from app.dependencies import get_password_reset_mailer, get_worldpop_service
 from app.main import app
 from app.models.models import User
 from app.repositories.users import UserRepository
+from app.services.worldpop import CoordinatesOutsideCountryError
 
 
 UserFactory = Callable[..., Awaitable[User]]
@@ -105,6 +106,32 @@ async def test_persistent_token_and_access_jwt_authenticate_api(
     )
     assert persistent.json() == {"pop": 42}
     assert jwt_access.json() == {"pop": 42}
+
+
+@pytest.mark.asyncio
+async def test_api_rejects_a_point_outside_the_worldpop_tile(
+    client: AsyncClient, user_factory: UserFactory
+) -> None:
+    await user_factory("api@example.com", bearer_token="persistent-token")
+
+    class FakeWorldPopService:
+        async def get_pop(self, iso3: str, lat: float, lon: float) -> int:
+            raise CoordinatesOutsideCountryError(iso3.strip().upper())
+
+    app.dependency_overrides[get_worldpop_service] = lambda: FakeWorldPopService()
+    response = await client.get(
+        "/api/pop",
+        params={"iso3": "nzl", "lat": -80, "lon": 170},
+        headers={"Authorization": "Bearer persistent-token"},
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "detail": (
+            "the submitted point is not within the bounds of the WorldPop tile "
+            "for country code NZL"
+        )
+    }
 
 
 @pytest.mark.asyncio
